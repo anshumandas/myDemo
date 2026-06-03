@@ -1,0 +1,36 @@
+{
+  "name": "@mydemo/core",
+  "version": "0.1.0",
+  "description": "Tauri demo-capture toolkit: drive a built app through scripted scenarios and record uniformly-framed GIFs / MP4s. LLM-authorable.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "templates",
+    "README.md",
+    "DESIGN.md",
+    "SKILL.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "webdriverio": ">=9"
+  },
+  "peerDependenciesMeta": {
+    "webdriverio": { "optional": false }
+  },
+  "devDependencies": {
+    "@types/node": ">=20",
+    "typescript": ">=5.4",
+    "webdriverio": "^9.27.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "//": "Consumed as raw TypeScript run by tsx (matches the host rig). No build step; `exports` points at .ts source. webdriverio + tsx resolve from the consuming app via peer/hoist."
+}
