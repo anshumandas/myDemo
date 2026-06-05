@@ -53,8 +53,74 @@ export interface ToolsConfig {
   tauriDriver: string;
   /** Native WebView2 driver, matched to the installed Edge version. */
   edgeDriver: string;
+  /** ChromeDriver, matched to the installed Chrome (browser driver, name:"chrome"). */
+  chromeDriver: string;
   ffmpeg: string;
   gifski: string;
+}
+
+/** Which engine drives + records the UI. Defaults to "tauri" for backward compat. */
+export type DriverKind = "tauri" | "browser";
+
+/** Supported real browsers for the `browser` driver. */
+export type BrowserName = "edge" | "chrome";
+
+/** How `h.goto("/route")` resolves for the browser driver. */
+export type RoutingMode = "hash" | "path";
+
+/**
+ * Optional web-server lifecycle for the browser driver — the analogue of the
+ * Tauri path's `vite preview` (server.ts). The engine spawns `command`, waits
+ * for the readiness signal, records, then tears it down. Omit the whole block
+ * (or pass `skipStartup` at the call site) when the app is already running.
+ */
+export interface WebServerConfigInput {
+  /**
+   * Start command. A string is run through the shell (`npm run dev`);
+   * an argv array is spawned directly (`["npm","run","dev"]`).
+   */
+  command: string | string[];
+  /** Working directory for the command. Default: rootDir. */
+  cwd?: string;
+  /** Extra env merged over augmentedEnv() for the server process. */
+  env?: Record<string, string>;
+  /**
+   * Readiness signal — an HTTP(S) URL polled until it answers. If omitted, the
+   * engine falls back to a TCP probe of the browser `url`'s port, and finally to
+   * the in-page `navAnchor` wait once the page is navigated.
+   */
+  readyUrl?: string;
+  /** Documentation-only alias: the navAnchor test-id that proves readiness in-page. */
+  readyTestId?: string;
+  /** How long to wait for readiness before failing. Default 120000. */
+  startupTimeoutMs?: number;
+}
+
+/** Browser-driver specific configuration (used only when driver === "browser"). */
+export interface BrowserConfigInput {
+  /** Which browser to drive (headed). Default "edge" (this repo vendors msedgedriver). */
+  name?: BrowserName;
+  /** Base web URL the app serves at, e.g. "http://localhost:3000". */
+  url: string;
+  /**
+   * Route mode for `h.goto("/route")`. "path" resolves against `url`
+   * (Next.js App Router); "hash" appends `#/route` (SPA hash routers).
+   * Default "path".
+   */
+  routing?: RoutingMode;
+  /**
+   * Logical window size. When set, the browser launches at this size and the
+   * window is measured as-is (chrome-free via app mode); when omitted the window
+   * is maximized like the Tauri path.
+   */
+  viewport?: { width: number; height: number };
+  /**
+   * Launch in app/kiosk mode (Edge/Chrome `--app=<url>`) so the captured frame
+   * is chrome-free (no tabs/address bar). Default true.
+   */
+  appMode?: boolean;
+  /** Optional web-server lifecycle (see {@link WebServerConfigInput}). */
+  webServer?: WebServerConfigInput;
 }
 
 /** What a consuming app passes to {@link defineConfig}. */
@@ -63,10 +129,24 @@ export interface DemoConfigInput {
   rootDir: string;
   /** Absolute path to the app's demo/ folder (where output/, fixtures/, .bin/ live). */
   demoDir: string;
-  /** App identity. */
-  app: AppIdentity;
-  /** URL the built debug binary loads its UI from (vite preview serves dist/ here). */
-  devUrl: string;
+  /**
+   * Which driver records the UI. "tauri" (default) drives the built native
+   * binary; "browser" drives a real headed Edge/Chrome window over a web URL.
+   */
+  driver?: DriverKind;
+  /**
+   * App identity. Required for the Tauri driver (window title, app-data dir,
+   * binary name). For the browser driver only `windowTitle` is meaningful (the
+   * page title used for capture); if omitted it is read live from `document.title`.
+   */
+  app?: Partial<AppIdentity>;
+  /** Browser-driver configuration. Required when `driver === "browser"`. */
+  browser?: BrowserConfigInput;
+  /**
+   * URL the built debug binary loads its UI from (vite preview serves dist/ here).
+   * Required for the Tauri driver; ignored by the browser driver (use `browser.url`).
+   */
+  devUrl?: string;
   /** Selector id to wait for after launch, proving the UI booted (e.g. "nav-dashboard"). */
   navAnchor: string;
 
@@ -92,8 +172,12 @@ export interface DemoConfigInput {
     native?: { cmd: string; args: string[] };
   };
 
-  /** Files to delete from the app-data dir before each recording (fresh state). */
-  resetFiles: string[];
+  /**
+   * Files to delete from the app-data dir before each recording (fresh state).
+   * Defaults to `[]` — typical for the browser driver, where state is owned by
+   * the web server, not a local app-data dir.
+   */
+  resetFiles?: string[];
 
   /** Path overrides (all relative to rootDir/demoDir unless absolute). */
   paths?: {
@@ -129,12 +213,37 @@ export interface Dirs {
   dist: string;
 }
 
+/** Resolved web-server lifecycle (see {@link WebServerConfigInput}). */
+export interface ResolvedWebServer {
+  command: string | string[];
+  cwd: string;
+  env: Record<string, string>;
+  readyUrl?: string;
+  readyTestId?: string;
+  startupTimeoutMs: number;
+}
+
+/** Resolved browser-driver configuration. */
+export interface ResolvedBrowserConfig {
+  name: BrowserName;
+  /** Base web URL, trailing slash trimmed. */
+  url: string;
+  routing: RoutingMode;
+  viewport?: { width: number; height: number };
+  appMode: boolean;
+  webServer?: ResolvedWebServer;
+}
+
 /** Fully-resolved configuration handed to every engine function. */
 export interface DemoConfig {
   rootDir: string;
   demoDir: string;
+  /** Which driver records the UI. */
+  driver: DriverKind;
   app: AppIdentity;
-  /** The built debug binary tauri-driver launches. */
+  /** Browser-driver configuration (present iff driver === "browser"). */
+  browser?: ResolvedBrowserConfig;
+  /** The built debug binary tauri-driver launches (Tauri driver). */
   appBinary: string;
   devUrl: string;
   navAnchor: string;
@@ -187,6 +296,60 @@ function defaultFontFile(): string {
  */
 export function defineConfig(input: DemoConfigInput): DemoConfig {
   const { rootDir, demoDir } = input;
+  const driver: DriverKind = input.driver ?? "tauri";
+
+  // Per-driver validation. Pure (shape checks only) — no I/O. Throw early with a
+  // clear message rather than fail deep inside the engine at record time.
+  if (driver === "tauri") {
+    const missing = (["windowTitle", "identifier", "binName"] as const).filter(
+      (k) => !input.app?.[k],
+    );
+    if (missing.length) {
+      throw new Error(
+        `defineConfig: driver "tauri" requires app.{${missing.join(", ")}}. ` +
+          `Set them, or use driver: "browser" for a web app.`,
+      );
+    }
+    if (!input.devUrl) {
+      throw new Error(`defineConfig: driver "tauri" requires devUrl (the URL the debug binary loads).`);
+    }
+    if (input.browser) {
+      throw new Error(`defineConfig: \`browser\` is only valid with driver: "browser" (got driver: "tauri").`);
+    }
+  } else {
+    if (!input.browser?.url) {
+      throw new Error(`defineConfig: driver "browser" requires browser.url (the app's base web URL).`);
+    }
+  }
+
+  const browser: ResolvedBrowserConfig | undefined =
+    driver === "browser" && input.browser
+      ? {
+          name: input.browser.name ?? "edge",
+          url: input.browser.url.replace(/\/+$/, ""),
+          routing: input.browser.routing ?? "path",
+          viewport: input.browser.viewport,
+          appMode: input.browser.appMode ?? true,
+          webServer: input.browser.webServer
+            ? {
+                command: input.browser.webServer.command,
+                cwd: abs(rootDir, input.browser.webServer.cwd, rootDir),
+                env: input.browser.webServer.env ?? {},
+                readyUrl: input.browser.webServer.readyUrl,
+                readyTestId: input.browser.webServer.readyTestId,
+                startupTimeoutMs: input.browser.webServer.startupTimeoutMs ?? 120_000,
+              }
+            : undefined,
+        }
+      : undefined;
+
+  // App identity always present in the resolved config. For the browser driver
+  // identifier/binName are unused; windowTitle is optional (read live if blank).
+  const app: AppIdentity = {
+    windowTitle: input.app?.windowTitle ?? "",
+    identifier: input.app?.identifier ?? "",
+    binName: input.app?.binName ?? "",
+  };
 
   const dirs: Dirs = {
     demo: demoDir,
@@ -198,17 +361,16 @@ export function defineConfig(input: DemoConfigInput): DemoConfig {
   };
 
   const tauriDir = abs(rootDir, input.paths?.tauriDir, join(rootDir, "src-tauri"));
-  const appBinary = join(
-    tauriDir,
-    "target",
-    "debug",
-    isWin ? `${input.app.binName}.exe` : input.app.binName,
-  );
+  const appBinary = app.binName
+    ? join(tauriDir, "target", "debug", isWin ? `${app.binName}.exe` : app.binName)
+    : "";
 
   const tools: ToolsConfig = {
     tauriDriver: input.tools?.tauriDriver ?? "tauri-driver",
     edgeDriver:
       input.tools?.edgeDriver ?? join(dirs.bin, isWin ? "msedgedriver.exe" : "msedgedriver"),
+    chromeDriver:
+      input.tools?.chromeDriver ?? join(dirs.bin, isWin ? "chromedriver.exe" : "chromedriver"),
     ffmpeg: input.tools?.ffmpeg ?? "ffmpeg",
     gifski: input.tools?.gifski ?? "gifski",
   };
@@ -233,9 +395,11 @@ export function defineConfig(input: DemoConfigInput): DemoConfig {
   return {
     rootDir,
     demoDir,
-    app: input.app,
+    driver,
+    app,
+    browser,
     appBinary,
-    devUrl: input.devUrl,
+    devUrl: input.devUrl ?? "",
     navAnchor: input.navAnchor,
     masterPassword: input.masterPassword ?? "",
     window: input.window ?? { width: 1440, height: 900 },
@@ -257,10 +421,10 @@ export function defineConfig(input: DemoConfigInput): DemoConfig {
       frontend: { cmd: "vite", args: input.build?.frontend?.args ?? ["build"] },
       native: input.build?.native ?? { cmd: "cargo", args: ["build"] },
     },
-    resetFiles: input.resetFiles,
+    resetFiles: input.resetFiles ?? [],
 
     appDataDir(): string {
-      const id = input.app.identifier;
+      const id = app.identifier;
       if (isWin) {
         const appData = process.env.APPDATA ?? join(homedir(), "AppData", "Roaming");
         return join(appData, id);

@@ -53,6 +53,9 @@ export async function buildNative(cfg: DemoConfig): Promise<void> {
  * components/selectors so the recorded UI is current).
  */
 export async function ensureBuilt(cfg: DemoConfig, force = false): Promise<void> {
+  // The browser driver has no Tauri frontend/native artifacts to build; the web
+  // app's own build/serve is the consumer's webServer.command (server.ts).
+  if (cfg.driver === "browser") return;
   const haveDist = await exists(join(cfg.dirs.dist, "index.html"));
   const haveBin = await exists(cfg.appBinary);
   if (force || !haveDist) await buildFrontend(cfg);

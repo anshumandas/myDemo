@@ -10,19 +10,27 @@
   },
   "files": [
     "src",
-    "templates",
+    "examples",
+    "scripts",
     "README.md",
     "DESIGN.md",
     "SKILL.md"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke.ts"
   },
   "peerDependencies": {
-    "webdriverio": ">=9"
+    "webdriverio": ">=9",
+    "@remotion/bundler": ">=4",
+    "@remotion/renderer": ">=4",
+    "remotion": ">=4"
   },
   "peerDependenciesMeta": {
-    "webdriverio": { "optional": false }
+    "webdriverio": { "optional": false },
+    "@remotion/bundler": { "optional": true },
+    "@remotion/renderer": { "optional": true },
+    "remotion": { "optional": true }
   },
   "devDependencies": {
     "@types/node": ">=20",

@@ -18,16 +18,25 @@ import type { Scenario } from "../types.ts";
 import { resetAppData } from "./reset.ts";
 import { ensureBuilt } from "./build.ts";
 import { startSession } from "./wdio.ts";
-import { startFrontendServer } from "./server.ts";
+import { startFrontendServer, startWebServer, type DevServer } from "./server.ts";
 import { startCapture, mp4ToGif } from "./capture.ts";
-import { focusMeasureClient } from "./win.ts";
 
-/** Kill any leftover app / native-driver processes between runs (Windows). */
+/** Process names to kill between runs, per driver (the app/browser + its driver). */
+function stragglerNames(cfg: DemoConfig): string[] {
+  if (cfg.driver === "browser") {
+    const b = cfg.browser;
+    const browserExe = b?.name === "chrome" ? "chrome.exe" : "msedge.exe";
+    const driverExe = basename(b?.name === "chrome" ? cfg.tools.chromeDriver : cfg.tools.edgeDriver);
+    return [driverExe, browserExe];
+  }
+  return [`${cfg.app.binName}.exe`, basename(cfg.tools.edgeDriver)];
+}
+
+/** Kill any leftover app/browser + driver processes between runs (Windows). */
 function killStragglers(cfg: DemoConfig): Promise<void> {
   if (platform() !== "win32") return Promise.resolve();
-  const names = [`${cfg.app.binName}.exe`, basename(cfg.tools.edgeDriver)];
   const args = ["/F", "/T"];
-  for (const n of names) args.push("/IM", n);
+  for (const n of stragglerNames(cfg)) args.push("/IM", n);
   return new Promise((resolve) => {
     const p = spawn("taskkill", args, { stdio: "ignore" });
     p.on("exit", () => resolve());
@@ -46,21 +55,27 @@ export async function record(cfg: DemoConfig, scenario: Scenario): Promise<void>
   await resetAppData(cfg);
   await killStragglers(cfg);
 
-  const server = await startFrontendServer(cfg);
+  // The Tauri driver serves the built dist/ via vite preview; the browser driver
+  // (optionally) spawns the consumer's web server. Both expose the same handle.
+  const server: DevServer =
+    cfg.driver === "browser" ? await startWebServer(cfg) : await startFrontendServer(cfg);
+  // The base URL the session should land on (the driver may already be there).
+  const baseUrl = cfg.driver === "browser" ? cfg.browser!.url : cfg.devUrl;
+
   const session = await startSession(cfg);
   let capture: ReturnType<typeof startCapture> | null = null;
   try {
     const b = session.browser;
-    // Force navigation: the webview can open before the dev server is reachable
-    // and get stuck on about:blank otherwise.
-    await b.url(cfg.devUrl).catch(() => undefined);
+    // Force navigation: the webview/browser can open before the server is
+    // reachable and get stuck on about:blank otherwise.
+    await b.url(baseUrl).catch(() => undefined);
     await session.helpers.waitFor(cfg.navAnchor, 30_000);
     await session.helpers.pause(700);
 
-    // Maximize + foreground the window and measure its client (web content)
-    // rect; the GIF encode normalizes this to a fixed, black-padded canvas so
-    // every recording is identically framed.
-    const region = await focusMeasureClient(cfg.app.windowTitle);
+    // Focus + size the target window and measure its client (web content) rect;
+    // the GIF encode normalizes this to a fixed, black-padded canvas so every
+    // recording is identically framed. The driver picks the window strategy.
+    const region = await session.focusMeasure();
     console.log(`• capturing client ${region.w}x${region.h} @ (${region.x},${region.y})`);
 
     // Off-camera setup (seed prerequisite data) before capture starts.

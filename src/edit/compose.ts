@@ -20,6 +20,7 @@ import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DemoConfig } from "../config.ts";
+import { renderRemotion } from "./remotion.ts";
 
 /** A recorded clip sliced from a scenario MP4. */
 export interface ClipSegment {
@@ -47,7 +48,25 @@ export interface CardSegment {
   bg?: string;
 }
 
-export type Segment = ClipSegment | CardSegment;
+/**
+ * A segment sourced from a Remotion render (brand intro/outro, animated feature
+ * card). The composition is rendered to a temp MP4, then normalized to the
+ * master canvas and joined exactly like a recorded clip — so a montage can weave
+ * synthetic and screencast segments together seamlessly.
+ */
+export interface RemotionSegment {
+  kind: "remotion";
+  /** Absolute path to the consumer's Remotion entry (registers compositions). */
+  entry: string;
+  /** Composition id to render. */
+  compositionId: string;
+  /** Input props passed to the composition (JSON-serializable). */
+  props?: Record<string, unknown>;
+  /** Optional lower-third caption burned over this segment. */
+  caption?: string;
+}
+
+export type Segment = ClipSegment | CardSegment | RemotionSegment;
 
 export interface VideoEdl {
   /** Output file stem (e.g. "marketing"). */
@@ -216,6 +235,38 @@ async function buildCard(
   return { path: out, duration: await probeDuration(out, env) };
 }
 
+/**
+ * Render a Remotion composition to a temp MP4, then normalize it through the
+ * SAME clip pipeline (scale-to-fit + pad + fps + optional caption) so it joins
+ * seamlessly with screencast clips. Keeps the EDL declarative — the consumer
+ * just names an `entry` + `compositionId`.
+ */
+async function buildRemotion(
+  cfg: DemoConfig,
+  seg: RemotionSegment,
+  out: string,
+  tmpDir: string,
+  idx: number,
+): Promise<Built> {
+  const env = cfg.augmentedEnv();
+  const raw = join(tmpDir, `remotion-${idx}.mp4`);
+  await renderRemotion(cfg, {
+    entry: seg.entry,
+    compositionId: seg.compositionId,
+    props: seg.props,
+    outFile: raw,
+  });
+  const dur = await probeDuration(raw, env);
+  // Reuse buildClip by presenting the render as a full-length clip source.
+  return buildClip(
+    cfg,
+    { kind: "clip", source: raw, in: 0, out: dur, caption: seg.caption },
+    out,
+    tmpDir,
+    idx,
+  );
+}
+
 /** Crossfade-chain (or hard-concat) normalized segments into one video file. */
 async function joinSegments(
   cfg: DemoConfig,
@@ -334,7 +385,9 @@ export async function compose(cfg: DemoConfig, edl: VideoEdl): Promise<string> {
       const b =
         seg.kind === "card"
           ? await buildCard(cfg, seg, out, tmpDir, i)
-          : await buildClip(cfg, seg, out, tmpDir, i);
+          : seg.kind === "remotion"
+            ? await buildRemotion(cfg, seg, out, tmpDir, i)
+            : await buildClip(cfg, seg, out, tmpDir, i);
       if (b.duration <= transition && edl.segments.length > 1) {
         throw new Error(`segment ${i} (${b.duration.toFixed(2)}s) is shorter than the ${transition}s crossfade`);
       }
