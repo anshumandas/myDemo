@@ -17,6 +17,7 @@ import type { DemoConfig } from "../config.ts";
 import type { Scenario } from "../types.ts";
 import { resetAppData } from "./reset.ts";
 import { ensureBuilt } from "./build.ts";
+import { doctor } from "./doctor.ts";
 import { startSession } from "./wdio.ts";
 import { startFrontendServer, startWebServer, type DevServer } from "./server.ts";
 import { startCapture, mp4ToGif } from "./capture.ts";
@@ -170,6 +171,17 @@ export async function runRecorderCli(opts: RecorderCliOptions): Promise<void> {
   const ids = argv.filter((a) => !a.startsWith("--"));
 
   await mkdir(cfg.dirs.output, { recursive: true });
+
+  // Preflight tool check, once, in the parent process. Workers skip it (the
+  // parent already reported); gifs-only skips the driver and just re-encodes.
+  // Non-fatal by design: warn and continue so a partially-equipped run still
+  // attempts to record rather than aborting before it starts.
+  if (!worker && !gifsOnly) {
+    const report = await doctor(cfg);
+    if (!report.ok) {
+      console.warn("⚠ doctor: some tools are missing — recording may fail deep in the engine. Continuing anyway.\n");
+    }
+  }
 
   if (gifsOnly) {
     const targets =
