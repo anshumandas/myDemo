@@ -13,6 +13,36 @@ const SEL = (testId: string) => `[data-testid="${testId}"]`;
 export const DEFAULT_TIMEOUT = 15_000;
 
 /**
+ * Resolve the first *displayed* element matching a test-id, waiting until one
+ * appears. Responsive apps commonly render multiple layouts and CSS-hide all but
+ * one (e.g. `hidden md:block` desktop + `block md:hidden` mobile) — so the same
+ * test-id exists several times in the DOM and a plain `$` returns the first,
+ * often-hidden, one. A UI rig must act on what's visible, so we pick the
+ * displayed match. (Hidden inputs for uploadFile are the deliberate exception.)
+ */
+async function firstDisplayed(
+  browser: WebdriverIO.Browser,
+  testId: string,
+  timeoutMs: number,
+): Promise<WebdriverIO.Element> {
+  let found: WebdriverIO.Element | null = null;
+  await browser.waitUntil(
+    async () => {
+      const els = await browser.$$(SEL(testId));
+      for (const el of els) {
+        if (await el.isDisplayed().catch(() => false)) {
+          found = el;
+          return true;
+        }
+      }
+      return false;
+    },
+    { timeout: timeoutMs, timeoutMsg: `no displayed element [data-testid="${testId}"] within ${timeoutMs}ms` },
+  );
+  return found as unknown as WebdriverIO.Element;
+}
+
+/**
  * Build the Helpers surface over a connected browser.
  *
  * @param browser   the WebdriverIO session
@@ -28,13 +58,12 @@ export function buildHelpers(
     browser,
     goto: (route) => navigate(route),
     async click(testId) {
-      const el = await browser.$(SEL(testId));
+      const el = await firstDisplayed(browser, testId, DEFAULT_TIMEOUT);
       await el.waitForClickable({ timeout: DEFAULT_TIMEOUT });
       await el.click();
     },
     async type(testId, text) {
-      const el = await browser.$(SEL(testId));
-      await el.waitForDisplayed({ timeout: DEFAULT_TIMEOUT });
+      const el = await firstDisplayed(browser, testId, DEFAULT_TIMEOUT);
       await el.setValue(text);
     },
     async uploadFile(testId, absPath) {
@@ -45,19 +74,17 @@ export function buildHelpers(
       await el.addValue(absPath);
     },
     async waitFor(testId, timeoutMs = DEFAULT_TIMEOUT) {
-      const el = await browser.$(SEL(testId));
-      await el.waitForDisplayed({ timeout: timeoutMs });
+      await firstDisplayed(browser, testId, timeoutMs);
     },
     async waitForText(testId, substr, timeoutMs = DEFAULT_TIMEOUT) {
-      const el = await browser.$(SEL(testId));
-      await el.waitForDisplayed({ timeout: timeoutMs });
+      const el = await firstDisplayed(browser, testId, timeoutMs);
       await browser.waitUntil(async () => (await el.getText()).includes(substr), {
         timeout: timeoutMs,
         timeoutMsg: `"${substr}" not in ${testId} within ${timeoutMs}ms`,
       });
     },
     async textOf(testId) {
-      const el = await browser.$(SEL(testId));
+      const el = await firstDisplayed(browser, testId, DEFAULT_TIMEOUT);
       return (await el.getText()).trim();
     },
     pause: (ms) => browser.pause(ms),

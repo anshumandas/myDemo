@@ -14,6 +14,9 @@
  * "path" mode (Next.js App Router) or "hash" mode (SPA hash routers).
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import { remote } from "webdriverio";
 import type { DemoConfig, ResolvedBrowserConfig } from "../../config.ts";
 import type { Mark } from "../../types.ts";
@@ -34,22 +37,41 @@ function resolveUrl(b: ResolvedBrowserConfig, route: string): string {
 }
 
 /** Driver-server binary + WebdriverIO capabilities for the chosen browser. */
-function plan(cfg: DemoConfig, b: ResolvedBrowserConfig): {
+function plan(cfg: DemoConfig, b: ResolvedBrowserConfig, userDataDir: string): {
   bin: string;
   caps: WebdriverIO.Capabilities;
 } {
   // Stability flags shared by both Chromium browsers. App mode gives a
   // chrome-free window; --window-size honors a configured viewport.
-  const args: string[] = ["--no-first-run", "--no-default-browser-check"];
+  //
+  // --user-data-dir is CRITICAL: without a fresh, isolated profile a launch
+  // attaches to the user's already-running browser (restoring their tabs,
+  // DevTools, device-emulation) and ignores --app / --window-size. A unique
+  // temp profile forces a clean, chrome-free, correctly-sized window every run.
+  const args: string[] = [
+    "--no-first-run",
+    "--no-default-browser-check",
+    `--user-data-dir=${userDataDir}`,
+    "--window-position=0,0",
+    "--disable-infobars", // drop the "controlled by automated test software" banner
+  ];
   if (b.appMode) args.push(`--app=${b.url}`);
   if (b.viewport) args.push(`--window-size=${b.viewport.width},${b.viewport.height}`);
+
+  // Excluding the `enable-automation` switch (+ no automation extension) removes
+  // the automation infobar so the captured frame is clean for marketing.
+  const opts = {
+    args,
+    excludeSwitches: ["enable-automation"],
+    useAutomationExtension: false,
+  };
 
   if (b.name === "chrome") {
     return {
       bin: cfg.tools.chromeDriver,
       caps: {
         browserName: "chrome",
-        "goog:chromeOptions": { args },
+        "goog:chromeOptions": opts,
       } as WebdriverIO.Capabilities,
     };
   }
@@ -57,7 +79,7 @@ function plan(cfg: DemoConfig, b: ResolvedBrowserConfig): {
     bin: cfg.tools.edgeDriver,
     caps: {
       browserName: "MicrosoftEdge",
-      "ms:edgeOptions": { args },
+      "ms:edgeOptions": opts,
     } as WebdriverIO.Capabilities,
   };
 }
@@ -66,7 +88,9 @@ async function start(cfg: DemoConfig): Promise<Session> {
   const b = cfg.browser;
   if (!b) throw new Error('browser driver requires resolved cfg.browser (driver: "browser").');
 
-  const { bin, caps } = plan(cfg, b);
+  // Unique throwaway profile per run (each scenario records in a fresh process).
+  const userDataDir = join(tmpdir(), `mydemo-${b.name}-${process.pid}-${cfg.driverPort}`);
+  const { bin, caps } = plan(cfg, b, userDataDir);
   const driver: ChildProcess = spawn(bin, [`--port=${cfg.driverPort}`], {
     stdio: ["ignore", "inherit", "inherit"],
     env: cfg.augmentedEnv(),
@@ -99,6 +123,8 @@ async function start(cfg: DemoConfig): Promise<Session> {
       /* session may already be gone */
     }
     driver.kill();
+    // Best-effort cleanup of the throwaway profile.
+    await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
   };
 
   return {
@@ -106,12 +132,27 @@ async function start(cfg: DemoConfig): Promise<Session> {
     helpers,
     marks,
     captureTitle: cfg.app.windowTitle,
-    // App-mode windows have no stable OS title beyond the page <title>; read it
-    // live (unless the consumer pinned app.windowTitle) and match by substring
-    // so a trailing browser suffix doesn't defeat the lookup. A configured
-    // viewport is measured as-is; otherwise the window is maximized like Tauri.
+    // Stamp THIS window with a unique OS title before measuring, so the
+    // title-based capture targeting (win.ts) can't grab a different browser
+    // window that happens to show the same page — e.g. the user's own browser
+    // open on the same dev URL, which otherwise wins by lower PID and is
+    // captured (its chrome, tabs, DevTools) at the wrong size. We control this
+    // page via WebDriver, so we set document.title to a unique marker; the
+    // app-mode OS window title follows it. The marker only needs to hold through
+    // measurement — once the client rect is locked, later navigations (which
+    // reset the title) don't affect the captured region. A configured viewport
+    // is measured as-is; otherwise the window is maximized like Tauri.
     focusMeasure: async () => {
-      const title = cfg.app.windowTitle || (await browser.getTitle());
+      const marker = `mydemo-capture-${process.pid}-${cfg.driverPort}`;
+      try {
+        await browser.execute((m: string) => {
+          document.title = m;
+        }, marker);
+        await browser.pause(150); // let the OS window title catch up
+      } catch {
+        /* if we can't set it, fall back to the live/ pinned title below */
+      }
+      const title = marker;
       return focusMeasureClient(title, {
         match: "contains",
         window: b.viewport ? "asis" : "maximize",
